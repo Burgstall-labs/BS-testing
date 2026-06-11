@@ -145,11 +145,11 @@ def _logo_mean_lum(lg: Image.Image) -> float:
 
 def _logo_mono_color(lg: Image.Image) -> tuple[int, int, int] | None:
     arr = np.asarray(lg, dtype=np.float32)
-    solid = arr[..., 3] > 80
+    solid = arr[..., 3] > 200
     if solid.sum() < 10:
         return None
     px = arr[..., :3][solid]
-    if px.std(axis=0).max() >= 18:
+    if px.std(axis=0).max() >= 10:
         return None
     return tuple((int(v) for v in px.mean(axis=0)))
 
