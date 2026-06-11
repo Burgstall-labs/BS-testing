@@ -133,6 +133,63 @@ class BSPadToAspect:
         mask[:, oy:oy + sh, ox:ox + sw] = 0.0
         return (_pil_to_tensor(canvas), mask)
 
+def _membrane_blend(g_np, p_np, hard, strip=12, clamp=0.12):
+    from scipy import ndimage
+    h, w, _ = g_np.shape
+
+    def banded(axis_all):
+        n = 0
+        while n < len(axis_all) and axis_all[n]:
+            n += 1
+        return n
+    rows_all = hard.all(axis=1)
+    cols_all = hard.all(axis=0)
+    top = banded(rows_all)
+    bottom = banded(rows_all[::-1])
+    left = banded(cols_all)
+    right = banded(cols_all[::-1])
+
+    def edge_value(strip_arr, edge_at_start):
+        n = strip_arr.shape[0]
+        idx = np.arange(n, dtype=np.float32)
+        mean_y = strip_arr.mean(axis=0)
+        slope = ((idx - idx.mean())[:, None, None] * (strip_arr - mean_y)).sum(axis=0) / ((idx - idx.mean()) ** 2).sum()
+        edge_idx = -0.5 if edge_at_start else n - 0.5
+        return mean_y + slope * (edge_idx - idx.mean())
+
+    def smooth_diff(orig_strip, gen_strip, orig_edge_at_start):
+        d = edge_value(orig_strip, orig_edge_at_start) - edge_value(gen_strip, not orig_edge_at_start)
+        valid = np.abs(d).max(axis=1) < clamp
+        if valid.any() and (not valid.all()):
+            idx = np.arange(d.shape[0], dtype=np.float32)
+            for ch in range(d.shape[1]):
+                d[~valid, ch] = np.interp(idx[~valid], idx[valid], d[valid, ch])
+        d = np.clip(d, -clamp, clamp)
+        return ndimage.gaussian_filter1d(d, sigma=16.0, axis=0)
+    if top > 2 * strip:
+        d = smooth_diff(p_np[top:top + strip], g_np[top - strip:top], True)
+        fall = (np.arange(top, dtype=np.float32) + 1) / top
+        g_np[:top] += d[None, :, :] * fall[:, None, None]
+        g_np[top:top + 3] = p_np[top:top + 3]
+    if bottom > 2 * strip:
+        s = h - bottom
+        d = smooth_diff(p_np[s - strip:s], g_np[s:s + strip], False)
+        fall = (np.arange(bottom, dtype=np.float32)[::-1] + 1) / bottom
+        g_np[s:] += d[None, :, :] * fall[:, None, None]
+        g_np[s - 3:s] = p_np[s - 3:s]
+    if left > 2 * strip:
+        d = smooth_diff(p_np[:, left:left + strip].transpose(1, 0, 2), g_np[:, left - strip:left].transpose(1, 0, 2), True)
+        fall = (np.arange(left, dtype=np.float32) + 1) / left
+        g_np[:, :left] += d[:, None, :].transpose(1, 0, 2) * fall[None, :, None]
+        g_np[:, left:left + 3] = p_np[:, left:left + 3]
+    if right > 2 * strip:
+        s = w - right
+        d = smooth_diff(p_np[:, s - strip:s].transpose(1, 0, 2), g_np[:, s:s + strip].transpose(1, 0, 2), False)
+        fall = (np.arange(right, dtype=np.float32)[::-1] + 1) / right
+        g_np[:, s:] += d[:, None, :].transpose(1, 0, 2) * fall[None, :, None]
+        g_np[:, s - 3:s] = p_np[:, s - 3:s]
+    return g_np
+
 class BSCompositePreserved:
 
     @classmethod
@@ -144,22 +201,33 @@ class BSCompositePreserved:
     CATEGORY = 'BS-testing'
 
     def composite(self, generated, placed, mask, feather):
+        from PIL import ImageFilter
+        from scipy import ndimage
         if mask.max() <= 0:
             return (placed,)
         _, h, w, _ = placed.shape
         if generated.shape[1:3] != placed.shape[1:3]:
             gen = _tensor_to_pil(generated).resize((w, h), Image.LANCZOS)
             generated = _pil_to_tensor(gen)
+        generated = generated[:1]
         m = Image.fromarray((mask[0].cpu().numpy() * 255).astype(np.uint8), mode='L')
         if m.size != (w, h):
             m = m.resize((w, h), Image.BILINEAR)
         binary = np.asarray(m, dtype=np.float32) / 255.0
+        hard = binary > 0.5
+        band_px = max(8, int(0.012 * max(h, w)))
+        inner = hard & ~ndimage.binary_erosion(hard, iterations=band_px)
+        outer = ndimage.binary_dilation(hard, iterations=band_px) & ~hard
+        if inner.any() and outer.any():
+            p_np = placed[0].cpu().numpy()
+            g_np = generated[0].cpu().numpy().copy()
+            g_np = _membrane_blend(g_np, p_np, hard)
+            generated = torch.from_numpy(np.clip(g_np, 0.0, 1.0))[None, ...]
         if feather > 0:
-            from PIL import ImageFilter
             m = m.filter(ImageFilter.GaussianBlur(feather))
-        soft = np.clip(np.asarray(m, dtype=np.float32) / 255.0 * 2.0, 0.0, 1.0)
+        soft = np.asarray(m, dtype=np.float32) / 255.0
         m_t = torch.from_numpy(np.maximum(soft, binary))[None, ..., None]
-        out = placed * (1.0 - m_t) + generated[:1] * m_t
+        out = placed * (1.0 - m_t) + generated * m_t
         return (out,)
 
 class BSCleanupComposite:
