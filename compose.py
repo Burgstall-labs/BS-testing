@@ -188,6 +188,9 @@ def _paste_logo(canvas: Image.Image, logo: Image.Image | None, y: float, target_
         ratio = 0.46 * w / logo.width
         lw = int(logo.width * ratio)
         target_h = max(8, int(logo.height * ratio))
+    if lw < 1.15 * target_h:
+        target_h = int(target_h * 1.35)
+        lw = int(logo.width * (target_h / logo.height))
     lg = logo.resize((lw, target_h), Image.LANCZOS)
     py = int(y)
     candidates = {'left': int(side_margin), 'center': int((w - lw) / 2), 'right': int(w - side_margin - lw)}
@@ -199,7 +202,8 @@ def _paste_logo(canvas: Image.Image, logo: Image.Image | None, y: float, target_
     px = candidates[chosen]
     lo, hi = _region_lum_band(canvas, (px, py, px + lw, py + target_h))
     palette = tuple(chip_colors) + ((250, 250, 250), (15, 15, 15))
-    if _logo_mono_color(lg) is not None:
+    mono = _logo_mono_color(lg)
+    if mono is not None and max(mono) - min(mono) <= 30:
         best = max(palette, key=lambda c: min(_lum_ratio(_lum(c), lo), _lum_ratio(_lum(c), hi)))
         lg = _tint(lg, best)
         logo_l = _lum(best)
