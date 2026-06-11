@@ -13,6 +13,11 @@ def _tensor_to_pil(t: torch.Tensor) -> Image.Image:
     arr = (t[0].cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
     return Image.fromarray(arr)
 _OPT_STR = ('STRING', {'forceInput': True})
+_SKIP_SENTINELS = {'', '-', 'none', 'null', 'skip'}
+
+def _clean_field(s) -> str:
+    s = (s or '').strip()
+    return '' if s.lower() in _SKIP_SENTINELS else s
 
 class BSLoadImageFromURL:
 
@@ -69,15 +74,15 @@ class BSAudienceCutsRender:
     CATEGORY = 'BS-testing'
 
     def render(self, hero, brand_kit, format=None, **cuts):
-        fmt = (format or '').strip()
+        fmt = _clean_field(format)
         if not fmt:
             return (torch.zeros((0, 8, 8, 3), dtype=torch.float32),)
         hero_pil = _tensor_to_pil(hero)
         frames = []
         for i in range(1, 5):
-            label = (cuts.get(f'cut{i}_label') or '').strip()
-            headline = (cuts.get(f'cut{i}_headline') or '').strip()
-            subhead = (cuts.get(f'cut{i}_subhead') or '').strip()
+            label = _clean_field(cuts.get(f'cut{i}_label'))
+            headline = _clean_field(cuts.get(f'cut{i}_headline'))
+            subhead = _clean_field(cuts.get(f'cut{i}_subhead'))
             if not (label or headline or subhead):
                 continue
             frames.append(_pil_to_tensor(compose_cut(hero_pil, brand_kit, headline, subhead, fmt)))
@@ -101,7 +106,7 @@ class BSPadToAspect:
 
     def pad(self, image, skip_when_empty, megapixels, format=None):
         from .compose import canvas_size
-        fmt = (format or '').strip()
+        fmt = _clean_field(format)
         if not fmt and skip_when_empty:
             dummy = torch.full((1, 64, 64, 3), 0.5, dtype=torch.float32)
             return (dummy, torch.zeros((1, 64, 64), dtype=torch.float32))
