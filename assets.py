@@ -17,12 +17,18 @@ def _cache_path(key: str, suffix: str='') -> Path:
     CACHE_DIR.mkdir(exist_ok=True)
     return CACHE_DIR / (hashlib.sha1(key.encode('utf-8')).hexdigest() + suffix)
 
+def _looks_like_html(data: bytes) -> bool:
+    head = data[:1024].lstrip().lower()
+    return head.startswith((b'<!doctype html', b'<html')) or b'<head' in head[:256]
+
 def fetch_bytes(url: str, *, timeout: float=30.0, user_agent: str='BS-testing/1.0') -> bytes:
     path = _cache_path(url)
     if path.is_file():
         return path.read_bytes()
     resp = requests.get(url, timeout=timeout, headers={'User-Agent': user_agent})
     resp.raise_for_status()
+    if _looks_like_html(resp.content):
+        raise ValueError(f'BS-testing: {url!r} returned a web page (HTML), not a file. Use a direct/raw file URL — e.g. raw.githubusercontent.com instead of a github.com/.../blob/... page, or a direct CDN link instead of a Drive/Dropbox share page.')
     path.write_bytes(resp.content)
     return resp.content
 
@@ -58,11 +64,21 @@ def load_image_from_spec(spec: str, *, target_width: int=1024) -> Image.Image:
         if not path.is_file():
             raise FileNotFoundError(f'BS-testing: image not found: {spec!r}')
         data = path.read_bytes()
+    if _looks_like_html(data):
+        raise ValueError(f'BS-testing: {spec!r} points to a web page (HTML), not an image. Use a direct/raw file URL.')
     if _looks_like_svg(data, spec):
-        img = _rasterize_svg(data, target_width)
+        try:
+            img = _rasterize_svg(data, target_width)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise ValueError(f'BS-testing: {spec!r} is not valid SVG ({exc}). If this is a share/viewer link, use the raw file URL instead.') from exc
     else:
-        img = Image.open(BytesIO(data))
-        img.load()
+        try:
+            img = Image.open(BytesIO(data))
+            img.load()
+        except Exception as exc:
+            raise ValueError(f'BS-testing: could not decode {spec!r} as an image ({exc}). Use a direct URL to a PNG/JPG/WebP/SVG file.') from exc
     return img.convert('RGBA')
 _FONT_FACE_RE = re.compile('@font-face\\s*\\{[^}]*\\}', re.DOTALL)
 _WEIGHT_RE = re.compile('font-weight:\\s*(\\d+)')
