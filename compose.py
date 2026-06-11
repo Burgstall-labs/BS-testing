@@ -163,7 +163,21 @@ def _region_lum_band(canvas: Image.Image, box: tuple[int, int, int, int]) -> tup
     lums = region @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32) / 255.0
     return (float(np.percentile(lums, 15)), float(np.percentile(lums, 85)))
 
-def _paste_logo(canvas: Image.Image, logo: Image.Image | None, x: float, y: float, target_h: float, *, center_x: bool=False, chip_colors: tuple[tuple[int, int, int], ...]=()) -> None:
+def _safe_insets(w: int, h: int) -> tuple[int, int, int]:
+    m = int(0.07 * min(w, h))
+    if h / w >= 1.6:
+        return (m, max(m, int(0.13 * h)), max(m, int(0.135 * h)))
+    return (m, m, m)
+
+def _region_busyness(canvas: Image.Image, box: tuple[int, int, int, int]) -> float:
+    region = np.asarray(canvas.crop(box).convert('L'), dtype=np.float32) / 255.0
+    if region.size < 16:
+        return 0.0
+    gx = float(np.abs(np.diff(region, axis=1)).mean())
+    gy = float(np.abs(np.diff(region, axis=0)).mean())
+    return 2.0 * (gx + gy) + 0.5 * float(region.std())
+
+def _paste_logo(canvas: Image.Image, logo: Image.Image | None, y: float, target_h: float, *, prefer: str='left', side_margin: int, chip_colors: tuple[tuple[int, int, int], ...]=()) -> None:
     if logo is None:
         return
     w, _ = canvas.size
@@ -175,8 +189,14 @@ def _paste_logo(canvas: Image.Image, logo: Image.Image | None, x: float, y: floa
         lw = int(logo.width * ratio)
         target_h = max(8, int(logo.height * ratio))
     lg = logo.resize((lw, target_h), Image.LANCZOS)
-    px = int((w - lw) / 2) if center_x else int(x)
     py = int(y)
+    candidates = {'left': int(side_margin), 'center': int((w - lw) / 2), 'right': int(w - side_margin - lw)}
+    scores = {k: _region_busyness(canvas, (cx, py, cx + lw, py + target_h)) for k, cx in candidates.items()}
+    chosen = prefer
+    best_alt = min((k for k in candidates if k != prefer), key=scores.__getitem__)
+    if scores[prefer] > 0.02 and scores[best_alt] < 0.55 * scores[prefer]:
+        chosen = best_alt
+    px = candidates[chosen]
     lo, hi = _region_lum_band(canvas, (px, py, px + lw, py + target_h))
     palette = tuple(chip_colors) + ((250, 250, 250), (15, 15, 15))
     if _logo_mono_color(lg) is not None:
@@ -196,6 +216,7 @@ def compose_cut(hero: Image.Image, brand: dict, headline: str, subhead: str, fmt
     w, h = canvas_size(fmt)
     base = min(w, h)
     m = int(0.07 * base)
+    _, top_in, bot_in = _safe_insets(w, h)
     headline = (headline or '').strip()
     subhead = (subhead or '').strip()
     c1, c2 = (brand['color1'], brand['color2'])
@@ -214,9 +235,9 @@ def compose_cut(hero: Image.Image, brand: dict, headline: str, subhead: str, fmt
     if tone == 'playful':
         _scrim(canvas, scrim_col, start_frac=0.4, max_alpha=225)
         _scrim(canvas, neutral_top, start_frac=0.84, max_alpha=90, from_top=True)
-        _paste_logo(canvas, logo, m, m, 0.08 * base, chip_colors=chip_colors)
+        _paste_logo(canvas, logo, top_in, 0.08 * base, prefer='left', side_margin=m, chip_colors=chip_colors)
         max_w = w - 2 * m
-        y_bottom = h - m
+        y_bottom = h - bot_in
         pill_h = 0.0
         if subhead:
             sub_f, sub_lines, ss = _fit_text(subhead, font_bold, max_w - 1.6 * m, 0.038 * base, 0.024 * base, 2)
@@ -235,7 +256,7 @@ def compose_cut(hero: Image.Image, brand: dict, headline: str, subhead: str, fmt
     elif tone == 'premium':
         _scrim(canvas, scrim_col, start_frac=0.46, max_alpha=200)
         _scrim(canvas, neutral_top, start_frac=0.86, max_alpha=80, from_top=True)
-        _paste_logo(canvas, logo, 0, int(1.1 * m), 0.065 * base, center_x=True, chip_colors=chip_colors)
+        _paste_logo(canvas, logo, max(int(1.1 * m), top_in), 0.065 * base, prefer='center', side_margin=m, chip_colors=chip_colors)
         max_w = int(0.86 * w) - 2 * int(0.0 * m)
         blocks_h = 0.0
         head_f = head_lines = hs = None
@@ -254,7 +275,7 @@ def compose_cut(hero: Image.Image, brand: dict, headline: str, subhead: str, fmt
             sub_f = _font(font_reg, ss)
             sub_tracked = (sub_text, tracking)
             blocks_h += int(0.7 * m) + 2 + int(0.7 * m) + _line_h(ss)
-        y = h - int(1.35 * m) - blocks_h
+        y = h - bot_in - int(0.35 * m) - blocks_h
         if headline:
             y += _draw_lines(draw, head_lines, head_f, hs, text_col, (w - max_w) / 2, y, align='center', box_w=max_w)
         if subhead:
@@ -266,7 +287,7 @@ def compose_cut(hero: Image.Image, brand: dict, headline: str, subhead: str, fmt
             _draw_tracked_center(draw, sub_text, sub_f, text_col + (225,), w / 2, y, tracking)
     elif tone == 'technical':
         _scrim(canvas, neutral_top, start_frac=0.86, max_alpha=80, from_top=True)
-        _paste_logo(canvas, logo, m, m, 0.075 * base, chip_colors=chip_colors)
+        _paste_logo(canvas, logo, top_in, 0.075 * base, prefer='left', side_margin=m, chip_colors=chip_colors)
         pad = int(0.85 * m)
         panel_w = w - 2 * m
         inner_w = panel_w - 2 * pad - int(0.012 * base) - int(0.5 * pad)
@@ -282,7 +303,7 @@ def compose_cut(hero: Image.Image, brand: dict, headline: str, subhead: str, fmt
                 content_h += int(0.35 * m)
             content_h += len(sub_lines) * _line_h(ss)
         panel_h = content_h + 2 * pad
-        x0, y0 = (m, h - m - panel_h)
+        x0, y0 = (m, h - bot_in - panel_h)
         box = (x0, y0, x0 + panel_w, y0 + panel_h)
         radius = int(0.018 * base)
         blurred = canvas.crop(box).filter(ImageFilter.GaussianBlur(0.014 * base))
@@ -320,7 +341,7 @@ def compose_cut(hero: Image.Image, brand: dict, headline: str, subhead: str, fmt
             content_h += len(sub_lines) * _line_h(ss)
         rule_h = max(3, int(0.005 * base))
         content_h += rule_h + int(0.45 * m)
-        band_h = content_h + int(1.5 * m)
+        band_h = content_h + int(1.5 * m) + max(0, bot_in - m)
         draw.rectangle((0, h - band_h, w, h), fill=band_col + (255,))
         accent = c1 if _contrast(c1, band_col) >= 1.8 else on_band
         y = h - band_h + int(0.75 * m)
@@ -331,5 +352,5 @@ def compose_cut(hero: Image.Image, brand: dict, headline: str, subhead: str, fmt
             y += int(0.3 * m)
         if subhead:
             _draw_lines(draw, sub_lines, sub_f, ss, on_band + (215,), m, y)
-        _paste_logo(canvas, logo, m, m, 0.07 * base, chip_colors=chip_colors)
+        _paste_logo(canvas, logo, top_in, 0.07 * base, prefer='left', side_margin=m, chip_colors=chip_colors)
     return canvas.convert('RGB')

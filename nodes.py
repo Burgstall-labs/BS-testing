@@ -2,7 +2,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 from PIL import Image
-from .assets import load_image_from_spec, resolve_font
+from .assets import knockout_uniform_background, load_image_from_spec, resolve_font
 from .compose import TONES, compose_cut, parse_hex
 
 def _pil_to_tensor(img: Image.Image) -> torch.Tensor:
@@ -54,7 +54,7 @@ class BSBrandKit:
         logo = None
         logo_url = (logo_url or '').strip()
         if logo_url:
-            logo = load_image_from_spec(logo_url, target_width=1200)
+            logo = knockout_uniform_background(load_image_from_spec(logo_url, target_width=1200))
         font_regular, font_bold = resolve_font(font)
         return ({'logo': logo, 'color1': parse_hex(primary_color1, (255, 255, 255)), 'color2': parse_hex(primary_color2, (17, 17, 17)), 'font_regular': font_regular, 'font_bold': font_bold, 'tone': (tone or 'minimal').strip().lower()},)
 
