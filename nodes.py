@@ -98,18 +98,19 @@ class BSPadToAspect:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {'required': {'image': ('IMAGE',), 'skip_when_empty': ('BOOLEAN', {'default': True}), 'megapixels': ('FLOAT', {'default': 1.0, 'min': 0.25, 'max': 2.5, 'step': 0.05})}, 'optional': {'format': _OPT_STR}}
-    RETURN_TYPES = ('IMAGE', 'MASK')
-    RETURN_NAMES = ('padded', 'outpaint_mask')
+        return {'required': {'image': ('IMAGE',), 'skip_when_empty': ('BOOLEAN', {'default': True}), 'megapixels': ('FLOAT', {'default': 1.0, 'min': 0.25, 'max': 2.5, 'step': 0.05}), 'grow_px': ('INT', {'default': 16, 'min': 0, 'max': 128})}, 'optional': {'format': _OPT_STR}}
+    RETURN_TYPES = ('IMAGE', 'MASK', 'MASK')
+    RETURN_NAMES = ('padded', 'outpaint_mask', 'sampler_mask')
     FUNCTION = 'pad'
     CATEGORY = 'BS-testing'
 
-    def pad(self, image, skip_when_empty, megapixels, format=None):
+    def pad(self, image, skip_when_empty, megapixels, grow_px=16, format=None):
         from .compose import canvas_size
         fmt = _clean_field(format)
         if not fmt and skip_when_empty:
             dummy = torch.full((1, 64, 64, 3), 0.5, dtype=torch.float32)
-            return (dummy, torch.zeros((1, 64, 64), dtype=torch.float32))
+            z = torch.zeros((1, 64, 64), dtype=torch.float32)
+            return (dummy, z, z)
         src = _tensor_to_pil(image)
         if src.width > 64 and src.height > 64:
             src = src.crop((2, 2, src.width - 2, src.height - 2))
@@ -117,7 +118,8 @@ class BSPadToAspect:
             scale = (megapixels * 1000000.0 / (src.width * src.height)) ** 0.5
             w, h = (_round16(src.width * scale), _round16(src.height * scale))
             out = src.resize((w, h), Image.LANCZOS)
-            return (_pil_to_tensor(out), torch.zeros((1, h, w), dtype=torch.float32))
+            z = torch.zeros((1, h, w), dtype=torch.float32)
+            return (_pil_to_tensor(out), z, z)
         cw, ch = canvas_size(fmt)
         scale = min(1.0, (self.EDIT_AREA / (cw * ch)) ** 0.5)
         w, h = (_round16(cw * scale), _round16(ch * scale))
@@ -125,7 +127,8 @@ class BSPadToAspect:
         if max(w / src.width, h / src.height) / fit < 1.02:
             from .compose import cover_crop
             out = cover_crop(src, w, h)
-            return (_pil_to_tensor(out), torch.zeros((1, h, w), dtype=torch.float32))
+            z = torch.zeros((1, h, w), dtype=torch.float32)
+            return (_pil_to_tensor(out), z, z)
         sw, sh = (max(1, round(src.width * fit)), max(1, round(src.height * fit)))
         placed = src.resize((sw, sh), Image.LANCZOS)
         canvas = Image.new('RGB', (w, h), (127, 127, 127))
@@ -133,7 +136,10 @@ class BSPadToAspect:
         canvas.paste(placed, (ox, oy))
         mask = torch.ones((1, h, w), dtype=torch.float32)
         mask[:, oy:oy + sh, ox:ox + sw] = 0.0
-        return (_pil_to_tensor(canvas), mask)
+        g = max(0, min(int(grow_px), (min(sw, sh) - 8) // 2))
+        sampler = torch.ones((1, h, w), dtype=torch.float32)
+        sampler[:, oy + g:oy + sh - g, ox + g:ox + sw - g] = 0.0
+        return (_pil_to_tensor(canvas), mask, sampler)
 
 def _membrane_blend(g_np, p_np, hard, strip=12, clamp=0.12):
     from scipy import ndimage
