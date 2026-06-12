@@ -80,36 +80,6 @@ def load_image_from_spec(spec: str, *, target_width: int=1024) -> Image.Image:
         except Exception as exc:
             raise ValueError(f'BS-testing: could not decode {spec!r} as an image ({exc}). Use a direct URL to a PNG/JPG/WebP/SVG file.') from exc
     return img.convert('RGBA')
-
-def knockout_uniform_background(img: 'Image.Image', tolerance: float=14.0) -> 'Image.Image':
-    import numpy as np
-    arr = np.asarray(img.convert('RGBA'), dtype=np.float32)
-    alpha = arr[..., 3]
-    if alpha.min() < 250:
-        return img
-    border = np.concatenate([arr[0, :, :3], arr[-1, :, :3], arr[:, 0, :3], arr[:, -1, :3]])
-    bg = border.mean(axis=0)
-    if border.std(axis=0).max() > 12:
-        return img
-    near_bg = np.abs(arr[..., :3] - bg).max(axis=2) <= tolerance
-    try:
-        from scipy import ndimage
-    except ImportError:
-        return img
-    labels, n = ndimage.label(near_bg)
-    if not n:
-        return img
-    edge_labels = np.unique(np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]]))
-    edge_labels = edge_labels[edge_labels != 0]
-    if edge_labels.size == 0:
-        return img
-    cut = np.isin(labels, edge_labels)
-    out = arr.copy()
-    out[..., 3] = np.where(cut, 0.0, out[..., 3])
-    soft = Image.fromarray(out[..., 3].astype(np.uint8), mode='L').filter(__import__('PIL.ImageFilter', fromlist=['GaussianBlur']).GaussianBlur(0.7))
-    result = Image.fromarray(out.astype(np.uint8), mode='RGBA')
-    result.putalpha(soft)
-    return result
 _FONT_FACE_RE = re.compile('@font-face\\s*\\{[^}]*\\}', re.DOTALL)
 _WEIGHT_RE = re.compile('font-weight:\\s*(\\d+)')
 _SRC_URL_RE = re.compile('url\\((https://[^)]+)\\)')

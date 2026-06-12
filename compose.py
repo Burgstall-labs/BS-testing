@@ -143,21 +143,6 @@ def _logo_mean_lum(lg: Image.Image) -> float:
     rgb = (arr[..., :3] * alpha).sum(axis=(0, 1)) / alpha.sum()
     return _lum(tuple(rgb))
 
-def _logo_mono_color(lg: Image.Image) -> tuple[int, int, int] | None:
-    arr = np.asarray(lg, dtype=np.float32)
-    solid = arr[..., 3] > 200
-    if solid.sum() < 10:
-        return None
-    px = arr[..., :3][solid]
-    if px.std(axis=0).max() >= 10:
-        return None
-    return tuple((int(v) for v in px.mean(axis=0)))
-
-def _tint(lg: Image.Image, color: tuple[int, int, int]) -> Image.Image:
-    out = Image.new('RGBA', lg.size, color + (0,))
-    out.putalpha(lg.getchannel('A'))
-    return out
-
 def _region_lum_band(canvas: Image.Image, box: tuple[int, int, int, int]) -> tuple[float, float]:
     region = np.asarray(canvas.crop(box).convert('RGB'), dtype=np.float32)
     lums = region @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32) / 255.0
@@ -193,27 +178,24 @@ def _paste_logo(canvas: Image.Image, logo: Image.Image | None, y: float, target_
         lw = int(logo.width * (target_h / logo.height))
     lg = logo.resize((lw, target_h), Image.LANCZOS)
     py = int(y)
-    candidates = {'left': int(side_margin), 'center': int((w - lw) / 2), 'right': int(w - side_margin - lw)}
+    gap = max(int(round(target_h)), int(0.35 * side_margin))
+    candidates = {'left': gap, 'center': int((w - lw) / 2), 'right': int(w - gap - lw)}
     scores = {k: _region_busyness(canvas, (cx, py, cx + lw, py + target_h)) for k, cx in candidates.items()}
     chosen = prefer
     best_alt = min((k for k in candidates if k != prefer), key=scores.__getitem__)
-    if scores[prefer] > 0.02 and scores[best_alt] < 0.55 * scores[prefer]:
+    if scores[prefer] > 0.02 and scores[best_alt] < 0.8 * scores[prefer]:
         chosen = best_alt
     px = candidates[chosen]
     lo, hi = _region_lum_band(canvas, (px, py, px + lw, py + target_h))
     palette = tuple(chip_colors) + ((250, 250, 250), (15, 15, 15))
-    mono = _logo_mono_color(lg)
-    if mono is not None and max(mono) - min(mono) <= 30:
-        best = max(palette, key=lambda c: min(_lum_ratio(_lum(c), lo), _lum_ratio(_lum(c), hi)))
-        lg = _tint(lg, best)
-        logo_l = _lum(best)
-    else:
-        logo_l = _logo_mean_lum(lg)
+    logo_l = _logo_mean_lum(lg)
     if min(_lum_ratio(logo_l, lo), _lum_ratio(logo_l, hi)) < 2.5:
         chip = max(palette, key=lambda c: _lum_ratio(_lum(c), logo_l))
-        pad = int(0.4 * target_h)
+        pad_x = max(2, int(0.25 * target_h))
+        pad_y = max(2, int(0.2 * target_h))
+        px = min(max(px, pad_x + 2), w - lw - pad_x - 2)
         draw = ImageDraw.Draw(canvas, 'RGBA')
-        draw.rounded_rectangle((px - pad, py - pad, px + lw + pad, py + target_h + pad), radius=int(0.5 * target_h), fill=chip + (235,))
+        draw.rounded_rectangle((px - pad_x, py - pad_y, px + lw + pad_x, py + target_h + pad_y), radius=int(0.3 * target_h), fill=chip + (235,))
     canvas.alpha_composite(lg, (px, py))
 
 def compose_cut(hero: Image.Image, brand: dict, headline: str, subhead: str, fmt: str) -> Image.Image:
