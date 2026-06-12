@@ -180,13 +180,13 @@ def _membrane_blend(g_np, p_np, hard, strip=12, clamp=0.12):
     if left > 2 * strip:
         d = smooth_diff(p_np[:, left:left + strip].transpose(1, 0, 2), g_np[:, left - strip:left].transpose(1, 0, 2), True)
         fall = (np.arange(left, dtype=np.float32) + 1) / left
-        g_np[:, :left] += d[:, None, :].transpose(1, 0, 2) * fall[None, :, None]
+        g_np[:, :left] += d[:, None, :] * fall[None, :, None]
         g_np[:, left:left + 3] = p_np[:, left:left + 3]
     if right > 2 * strip:
         s = w - right
         d = smooth_diff(p_np[:, s - strip:s].transpose(1, 0, 2), g_np[:, s:s + strip].transpose(1, 0, 2), False)
         fall = (np.arange(right, dtype=np.float32)[::-1] + 1) / right
-        g_np[:, s:] += d[:, None, :].transpose(1, 0, 2) * fall[None, :, None]
+        g_np[:, s:] += d[:, None, :] * fall[None, :, None]
         g_np[:, s - 3:s] = p_np[:, s - 3:s]
     return g_np
 
