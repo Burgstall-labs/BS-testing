@@ -271,7 +271,7 @@ class BSCompositePreserved:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {'required': {'generated': ('IMAGE',), 'placed': ('IMAGE',), 'mask': ('MASK',), 'feather': ('INT', {'default': 24, 'min': 0, 'max': 256})}}
+        return {'required': {'generated': ('IMAGE',), 'placed': ('IMAGE',), 'mask': ('MASK',), 'feather': ('INT', {'default': 8, 'min': 0, 'max': 256})}}
     RETURN_TYPES = ('IMAGE',)
     RETURN_NAMES = ('image',)
     FUNCTION = 'composite'
