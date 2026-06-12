@@ -133,61 +133,49 @@ class BSPadToAspect:
         mask[:, oy:oy + sh, ox:ox + sw] = 0.0
         return (_pil_to_tensor(canvas), mask)
 
-def _membrane_blend(g_np, p_np, hard, strip=12, clamp=0.12):
+def _correct_drift(g_np, p_np, hard, sigma=16.0, reach_frac=0.55, clamp=0.2):
     from scipy import ndimage
     h, w, _ = g_np.shape
 
-    def banded(axis_all):
+    def band(flags):
         n = 0
-        while n < len(axis_all) and axis_all[n]:
+        while n < len(flags) and flags[n]:
             n += 1
         return n
     rows_all = hard.all(axis=1)
     cols_all = hard.all(axis=0)
-    top = banded(rows_all)
-    bottom = banded(rows_all[::-1])
-    left = banded(cols_all)
-    right = banded(cols_all[::-1])
-
-    def edge_value(strip_arr, edge_at_start):
-        n = strip_arr.shape[0]
-        idx = np.arange(n, dtype=np.float32)
-        mean_y = strip_arr.mean(axis=0)
-        slope = ((idx - idx.mean())[:, None, None] * (strip_arr - mean_y)).sum(axis=0) / ((idx - idx.mean()) ** 2).sum()
-        edge_idx = -0.5 if edge_at_start else n - 0.5
-        return mean_y + slope * (edge_idx - idx.mean())
-
-    def smooth_diff(orig_strip, gen_strip, orig_edge_at_start):
-        d = edge_value(orig_strip, orig_edge_at_start) - edge_value(gen_strip, not orig_edge_at_start)
-        valid = np.abs(d).max(axis=1) < clamp
-        if valid.any() and (not valid.all()):
-            idx = np.arange(d.shape[0], dtype=np.float32)
-            for ch in range(d.shape[1]):
-                d[~valid, ch] = np.interp(idx[~valid], idx[valid], d[valid, ch])
-        d = np.clip(d, -clamp, clamp)
-        return ndimage.gaussian_filter1d(d, sigma=16.0, axis=0)
-    if top > 2 * strip:
-        d = smooth_diff(p_np[top:top + strip], g_np[top - strip:top], True)
-        fall = (np.arange(top, dtype=np.float32) + 1) / top
-        g_np[:top] += d[None, :, :] * fall[:, None, None]
-        g_np[top:top + 3] = p_np[top:top + 3]
-    if bottom > 2 * strip:
+    top, bottom = (band(rows_all), band(rows_all[::-1]))
+    left, right = (band(cols_all), band(cols_all[::-1]))
+    filled = p_np.copy()
+    if top:
+        src = np.clip(2 * top - 1 - np.arange(top), top, h - bottom - 1)
+        filled[:top] = np.clip(2.0 * p_np[top] - p_np[src], 0.0, 1.0)
+    if bottom:
         s = h - bottom
-        d = smooth_diff(p_np[s - strip:s], g_np[s:s + strip], False)
-        fall = (np.arange(bottom, dtype=np.float32)[::-1] + 1) / bottom
-        g_np[s:] += d[None, :, :] * fall[:, None, None]
-        g_np[s - 3:s] = p_np[s - 3:s]
-    if left > 2 * strip:
-        d = smooth_diff(p_np[:, left:left + strip].transpose(1, 0, 2), g_np[:, left - strip:left].transpose(1, 0, 2), True)
-        fall = (np.arange(left, dtype=np.float32) + 1) / left
-        g_np[:, :left] += d[:, None, :] * fall[None, :, None]
-        g_np[:, left:left + 3] = p_np[:, left:left + 3]
-    if right > 2 * strip:
+        src = np.clip(2 * s - 1 - np.arange(s, h), top, s - 1)
+        filled[s:] = np.clip(2.0 * p_np[s - 1] - p_np[src], 0.0, 1.0)
+    if left:
+        src = np.clip(2 * left - 1 - np.arange(left), left, w - right - 1)
+        filled[:, :left] = np.clip(2.0 * p_np[:, left][:, None, :] - p_np[:, src], 0.0, 1.0)
+    if right:
         s = w - right
-        d = smooth_diff(p_np[:, s - strip:s].transpose(1, 0, 2), g_np[:, s:s + strip].transpose(1, 0, 2), False)
-        fall = (np.arange(right, dtype=np.float32)[::-1] + 1) / right
-        g_np[:, s:] += d[:, None, :] * fall[None, :, None]
-        g_np[:, s - 3:s] = p_np[:, s - 3:s]
+        src = np.clip(2 * s - 1 - np.arange(s, w), left, s - 1)
+        filled[:, s:] = np.clip(2.0 * p_np[:, s - 1][:, None, :] - p_np[:, src], 0.0, 1.0)
+    w_pad = hard.astype(np.float32)
+    wb = np.maximum(ndimage.gaussian_filter(w_pad, sigma), 0.0001)
+    T = np.empty_like(g_np)
+    G_low = np.empty_like(g_np)
+    for ch in range(3):
+        T[..., ch] = ndimage.gaussian_filter(filled[..., ch], sigma)
+        G_low[..., ch] = ndimage.gaussian_filter(g_np[..., ch] * w_pad, sigma) / wb
+    dist = ndimage.distance_transform_edt(hard)
+    reach = max(48.0, float(dist.max()) * reach_frac)
+    weight = np.clip(1.0 - dist / reach, 0.0, 1.0) * (dist > 0)
+    corr = np.clip(T - G_low, -clamp, clamp) * weight[..., None]
+    g_np = np.clip(g_np + corr, 0.0, 1.0)
+    g_np[(dist > 0) & (dist <= 4)] = T[(dist > 0) & (dist <= 4)]
+    pin = ndimage.binary_dilation(hard, iterations=3) & ~hard
+    g_np[pin] = p_np[pin]
     return g_np
 
 class BSCompositePreserved:
@@ -215,18 +203,14 @@ class BSCompositePreserved:
             m = m.resize((w, h), Image.BILINEAR)
         binary = np.asarray(m, dtype=np.float32) / 255.0
         hard = binary > 0.5
-        band_px = max(8, int(0.012 * max(h, w)))
-        inner = hard & ~ndimage.binary_erosion(hard, iterations=band_px)
-        outer = ndimage.binary_dilation(hard, iterations=band_px) & ~hard
-        if inner.any() and outer.any():
-            p_np = placed[0].cpu().numpy()
-            g_np = generated[0].cpu().numpy().copy()
-            g_np = _membrane_blend(g_np, p_np, hard)
-            generated = torch.from_numpy(np.clip(g_np, 0.0, 1.0))[None, ...]
+        p_np = placed[0].cpu().numpy()
+        g_np = _correct_drift(generated[0].cpu().numpy().copy(), p_np, hard)
+        generated = torch.from_numpy(g_np)[None, ...]
         if feather > 0:
             m = m.filter(ImageFilter.GaussianBlur(feather))
         soft = np.asarray(m, dtype=np.float32) / 255.0
-        m_t = torch.from_numpy(np.maximum(soft, binary))[None, ..., None]
+        align = np.clip(1.0 - ndimage.gaussian_filter(np.abs(p_np - g_np).max(axis=2), 8.0) * 6.0, 0.0, 1.0)
+        m_t = torch.from_numpy(np.maximum(soft * align, binary))[None, ..., None]
         out = placed * (1.0 - m_t) + generated * m_t
         return (out,)
 
@@ -252,6 +236,18 @@ class BSCleanupComposite:
             size = orig.size
             clean = clean.resize(size, Image.LANCZOS)
         w, h = size
+        o_arr = np.asarray(orig, dtype=np.float32)
+        c_arr = np.asarray(clean, dtype=np.float32)
+        ol = o_arr.mean(axis=2) - o_arr.mean()
+        cl = c_arr.mean(axis=2) - c_arr.mean()
+        cc = np.fft.irfft2(np.fft.rfft2(ol) * np.conj(np.fft.rfft2(cl)), s=ol.shape)
+        dy, dx = np.unravel_index(np.argmax(cc), cc.shape)
+        if dy > h // 2:
+            dy -= h
+        if dx > w // 2:
+            dx -= w
+        if 0 < max(abs(dy), abs(dx)) <= 16:
+            clean = Image.fromarray(np.roll(np.asarray(clean), (dy, dx), axis=(0, 1)))
         blur_r = max(1.0, 0.002 * max(w, h))
         ob = np.asarray(orig.filter(ImageFilter.GaussianBlur(blur_r)), dtype=np.float32)
         cb = np.asarray(clean.filter(ImageFilter.GaussianBlur(blur_r)), dtype=np.float32)
