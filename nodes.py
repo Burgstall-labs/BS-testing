@@ -111,6 +111,8 @@ class BSPadToAspect:
             dummy = torch.full((1, 64, 64, 3), 0.5, dtype=torch.float32)
             return (dummy, torch.zeros((1, 64, 64), dtype=torch.float32))
         src = _tensor_to_pil(image)
+        if src.width > 64 and src.height > 64:
+            src = src.crop((2, 2, src.width - 2, src.height - 2))
         if not fmt:
             scale = (megapixels * 1000000.0 / (src.width * src.height)) ** 0.5
             w, h = (_round16(src.width * scale), _round16(src.height * scale))
@@ -133,6 +135,63 @@ class BSPadToAspect:
         mask[:, oy:oy + sh, ox:ox + sw] = 0.0
         return (_pil_to_tensor(canvas), mask)
 
+def _membrane_blend(g_np, p_np, hard, strip=12, clamp=0.12):
+    from scipy import ndimage
+    h, w, _ = g_np.shape
+
+    def banded(axis_all):
+        n = 0
+        while n < len(axis_all) and axis_all[n]:
+            n += 1
+        return n
+    rows_all = hard.all(axis=1)
+    cols_all = hard.all(axis=0)
+    top = banded(rows_all)
+    bottom = banded(rows_all[::-1])
+    left = banded(cols_all)
+    right = banded(cols_all[::-1])
+
+    def edge_value(strip_arr, edge_at_start):
+        n = strip_arr.shape[0]
+        idx = np.arange(n, dtype=np.float32)
+        mean_y = strip_arr.mean(axis=0)
+        slope = ((idx - idx.mean())[:, None, None] * (strip_arr - mean_y)).sum(axis=0) / ((idx - idx.mean()) ** 2).sum()
+        edge_idx = -0.5 if edge_at_start else n - 0.5
+        return mean_y + slope * (edge_idx - idx.mean())
+
+    def smooth_diff(orig_strip, gen_strip, orig_edge_at_start):
+        d = edge_value(orig_strip, orig_edge_at_start) - edge_value(gen_strip, not orig_edge_at_start)
+        valid = np.abs(d).max(axis=1) < clamp
+        if valid.any() and (not valid.all()):
+            idx = np.arange(d.shape[0], dtype=np.float32)
+            for ch in range(d.shape[1]):
+                d[~valid, ch] = np.interp(idx[~valid], idx[valid], d[valid, ch])
+        d = np.clip(d, -clamp, clamp)
+        return ndimage.gaussian_filter1d(d, sigma=16.0, axis=0)
+    if top > 2 * strip:
+        d = smooth_diff(p_np[top:top + strip], g_np[top - strip:top], True)
+        fall = (np.arange(top, dtype=np.float32) + 1) / top
+        g_np[:top] += d[None, :, :] * fall[:, None, None]
+        g_np[top:top + 3] = p_np[top:top + 3]
+    if bottom > 2 * strip:
+        s = h - bottom
+        d = smooth_diff(p_np[s - strip:s], g_np[s:s + strip], False)
+        fall = (np.arange(bottom, dtype=np.float32)[::-1] + 1) / bottom
+        g_np[s:] += d[None, :, :] * fall[:, None, None]
+        g_np[s - 3:s] = p_np[s - 3:s]
+    if left > 2 * strip:
+        d = smooth_diff(p_np[:, left:left + strip].transpose(1, 0, 2), g_np[:, left - strip:left].transpose(1, 0, 2), True)
+        fall = (np.arange(left, dtype=np.float32) + 1) / left
+        g_np[:, :left] += d[:, None, :] * fall[None, :, None]
+        g_np[:, left:left + 3] = p_np[:, left:left + 3]
+    if right > 2 * strip:
+        s = w - right
+        d = smooth_diff(p_np[:, s - strip:s].transpose(1, 0, 2), g_np[:, s:s + strip].transpose(1, 0, 2), False)
+        fall = (np.arange(right, dtype=np.float32)[::-1] + 1) / right
+        g_np[:, s:] += d[:, None, :] * fall[None, :, None]
+        g_np[:, s - 3:s] = p_np[:, s - 3:s]
+    return g_np
+
 def _correct_drift(g_np, p_np, hard, sigma=16.0, reach_frac=0.55, clamp=0.2):
     from scipy import ndimage
     h, w, _ = g_np.shape
@@ -146,21 +205,25 @@ def _correct_drift(g_np, p_np, hard, sigma=16.0, reach_frac=0.55, clamp=0.2):
     cols_all = hard.all(axis=0)
     top, bottom = (band(rows_all), band(rows_all[::-1]))
     left, right = (band(cols_all), band(cols_all[::-1]))
+    D = 0.08
+
+    def extend(edge, src_vals):
+        return np.clip(edge + np.clip(edge - src_vals, -D, D), 0.0, 1.0)
     filled = p_np.copy()
     if top:
-        src = np.clip(2 * top - 1 - np.arange(top), top, h - bottom - 1)
-        filled[:top] = np.clip(2.0 * p_np[top] - p_np[src], 0.0, 1.0)
+        src = np.clip(2 * top - 1 - np.arange(top), top + 2, h - bottom - 1)
+        filled[:top] = extend(p_np[top + 2:top + 8].mean(axis=0), p_np[src])
     if bottom:
         s = h - bottom
-        src = np.clip(2 * s - 1 - np.arange(s, h), top, s - 1)
-        filled[s:] = np.clip(2.0 * p_np[s - 1] - p_np[src], 0.0, 1.0)
+        src = np.clip(2 * s - 1 - np.arange(s, h), top, s - 3)
+        filled[s:] = extend(p_np[s - 8:s - 2].mean(axis=0), p_np[src])
     if left:
-        src = np.clip(2 * left - 1 - np.arange(left), left, w - right - 1)
-        filled[:, :left] = np.clip(2.0 * p_np[:, left][:, None, :] - p_np[:, src], 0.0, 1.0)
+        src = np.clip(2 * left - 1 - np.arange(left), left + 2, w - right - 1)
+        filled[:, :left] = extend(p_np[:, left + 2:left + 8].mean(axis=1)[:, None, :], p_np[:, src])
     if right:
         s = w - right
-        src = np.clip(2 * s - 1 - np.arange(s, w), left, s - 1)
-        filled[:, s:] = np.clip(2.0 * p_np[:, s - 1][:, None, :] - p_np[:, src], 0.0, 1.0)
+        src = np.clip(2 * s - 1 - np.arange(s, w), left, s - 3)
+        filled[:, s:] = extend(p_np[:, s - 8:s - 2].mean(axis=1)[:, None, :], p_np[:, src])
     w_pad = hard.astype(np.float32)
     wb = np.maximum(ndimage.gaussian_filter(w_pad, sigma), 0.0001)
     T = np.empty_like(g_np)
@@ -171,9 +234,35 @@ def _correct_drift(g_np, p_np, hard, sigma=16.0, reach_frac=0.55, clamp=0.2):
     dist = ndimage.distance_transform_edt(hard)
     reach = max(48.0, float(dist.max()) * reach_frac)
     weight = np.clip(1.0 - dist / reach, 0.0, 1.0) * (dist > 0)
+    grad = ndimage.gaussian_gradient_magnitude(p_np.mean(axis=2), 1.5)
+    gate = np.zeros_like(weight)
+    if top:
+        if float(np.percentile(grad[top + 6:top + 26], 90)) < 0.008:
+            gate[:top] = 1.0
+    if bottom:
+        if float(np.percentile(grad[h - bottom - 26:h - bottom - 6], 90)) < 0.008:
+            gate[h - bottom:] = 1.0
+    if left:
+        if float(np.percentile(grad[:, left + 6:left + 26], 90)) < 0.008:
+            gate[:, :left] = 1.0
+    if right:
+        if float(np.percentile(grad[:, w - right - 26:w - right - 6], 90)) < 0.008:
+            gate[:, w - right:] = 1.0
+    weight = weight * gate
     corr = np.clip(T - G_low, -clamp, clamp) * weight[..., None]
     g_np = np.clip(g_np + corr, 0.0, 1.0)
-    g_np[(dist > 0) & (dist <= 4)] = T[(dist > 0) & (dist <= 4)]
+    near_w = 24.0
+    dev = np.abs(g_np - T).max(axis=2)
+    pad_f = hard.astype(np.float32)
+    row_dev = (dev * pad_f).sum(axis=1) / np.maximum(pad_f.sum(axis=1), 1.0)
+    col_dev = (dev * pad_f).sum(axis=0) / np.maximum(pad_f.sum(axis=0), 1.0)
+    line_strength = np.maximum(row_dev[:, None], col_dev[None, :])
+    w_px = np.clip(dev * 6.0, 0.0, 1.0) * np.clip(1.0 - dist / near_w, 0.0, 1.0)
+    w_line = np.clip(line_strength * 18.0, 0.0, 1.0) * (dist <= 48.0)
+    w_fix = np.where(dist > 0, np.maximum(w_px, w_line), 0.0)
+    w_fix = np.maximum(w_fix, ((dist > 0) & (dist <= 3)).astype(np.float32))
+    w_fix = w_fix * gate
+    g_np = g_np + (T - g_np) * w_fix[..., None]
     pin = ndimage.binary_dilation(hard, iterations=3) & ~hard
     g_np[pin] = p_np[pin]
     return g_np
@@ -202,9 +291,20 @@ class BSCompositePreserved:
         if m.size != (w, h):
             m = m.resize((w, h), Image.BILINEAR)
         binary = np.asarray(m, dtype=np.float32) / 255.0
+        import os
+        dump_dir = os.environ.get('BSRF_DUMP')
+        if dump_dir:
+            from pathlib import Path
+            d = Path(dump_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            n = len(list(d.glob('*_mask.png')))
+            _tensor_to_pil(placed).save(d / f'{n:02d}_placed.png')
+            _tensor_to_pil(generated).save(d / f'{n:02d}_gen.png')
+            m.save(d / f'{n:02d}_mask.png')
         hard = binary > 0.5
         p_np = placed[0].cpu().numpy()
-        g_np = _correct_drift(generated[0].cpu().numpy().copy(), p_np, hard)
+        g_np = np.clip(_membrane_blend(generated[0].cpu().numpy().copy(), p_np, hard), 0.0, 1.0)
+        g_np = _correct_drift(g_np, p_np, hard)
         generated = torch.from_numpy(g_np)[None, ...]
         if feather > 0:
             m = m.filter(ImageFilter.GaussianBlur(feather))
