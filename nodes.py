@@ -309,7 +309,24 @@ class BSCompositePreserved:
             m.save(d / f'{n:02d}_mask.png')
         hard = binary > 0.5
         p_np = placed[0].cpu().numpy()
-        g_np = np.clip(_membrane_blend(generated[0].cpu().numpy().copy(), p_np, hard), 0.0, 1.0)
+        g_np = generated[0].cpu().numpy().copy()
+        orig_region = ~hard
+        if orig_region.sum() > 20000:
+            X = g_np[orig_region].reshape(-1, 3)
+            Y = p_np[orig_region].reshape(-1, 3)
+            if X.shape[0] > 200000:
+                idx = np.linspace(0, X.shape[0] - 1, 200000).astype(np.int64)
+                X, Y = (X[idx], Y[idx])
+            aligned = np.abs(X - Y).max(axis=1) < 0.12
+            if aligned.sum() > 5000 and aligned.mean() > 0.9:
+                Xa, Ya = (X[aligned], Y[aligned])
+                for ch in range(3):
+                    a, b = np.polyfit(Xa[:, ch], Ya[:, ch], 1)
+                    a = float(np.clip(a, 0.85, 1.18))
+                    b = float(np.clip(b, -0.08, 0.08))
+                    g_np[..., ch] = a * g_np[..., ch] + b
+                g_np = np.clip(g_np, 0.0, 1.0)
+        g_np = np.clip(_membrane_blend(g_np, p_np, hard), 0.0, 1.0)
         g_np = _correct_drift(g_np, p_np, hard)
         generated = torch.from_numpy(g_np)[None, ...]
         if feather > 0:
